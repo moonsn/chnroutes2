@@ -1,0 +1,127 @@
+name: Sync CHN Routes
+
+on:
+  schedule:
+    # 每小时整点后5分钟检查一次更新（公共仓库无限制）
+    - cron: '5 * * * *'
+  workflow_dispatch:
+    # 允许手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+    
+    - name: Setup Git
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+    
+    - name: Get latest commit from source repository
+      id: get_latest_commit
+      run: |
+        # 获取源仓库的最新提交哈希（只获取必要信息）
+        LATEST_COMMIT=$(curl -s "https://api.github.com/repos/misakaio/chnroutes2/commits/master" | jq -r '.sha')
+        if [ "$LATEST_COMMIT" = "null" ] || [ -z "$LATEST_COMMIT" ]; then
+          echo "Failed to get latest commit, exiting"
+          exit 1
+        fi
+        echo "latest_commit=$LATEST_COMMIT" >> $GITHUB_OUTPUT
+        echo "Latest commit: $LATEST_COMMIT"
+    
+    - name: Check if we need to update
+      id: check_update
+      run: |
+        # 检查是否有记录文件
+        if [ -f ".last_sync_commit" ]; then
+          LAST_COMMIT=$(cat .last_sync_commit)
+          echo "Last synced commit: $LAST_COMMIT"
+        else
+          LAST_COMMIT=""
+          echo "No previous sync record found"
+        fi
+        
+        LATEST_COMMIT="${{ steps.get_latest_commit.outputs.latest_commit }}"
+        
+        if [ "$LAST_COMMIT" = "$LATEST_COMMIT" ]; then
+          echo "No new commits, skipping update"
+          echo "need_update=false" >> $GITHUB_OUTPUT
+        else
+          echo "New commits found, proceeding with update"
+          echo "need_update=true" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Download and process chnroutes.txt
+      if: steps.check_update.outputs.need_update == 'true'
+      run: |
+        # 下载原始文件
+        curl -o chnroutes_raw.txt "https://raw.githubusercontent.com/misakaio/chnroutes2/master/chnroutes.txt"
+        
+        # 去除注释行（以#开头的行）和空行
+        grep -v '^#' chnroutes_raw.txt | grep -v '^$' > chnroutes_processed.txt
+        
+        # 检查处理后的文件是否为空
+        if [ ! -s chnroutes_processed.txt ]; then
+          echo "Processed file is empty, skipping update"
+          exit 0
+        fi
+        
+        echo "Original file line count: $(wc -l < chnroutes_raw.txt)"
+        echo "Processed file line count: $(wc -l < chnroutes_processed.txt)"
+    
+    - name: Check if content changed
+      if: steps.check_update.outputs.need_update == 'true'
+      id: check_content
+      run: |
+        # 检查内容是否有变化
+        if [ -f "chnroutes.txt" ]; then
+          if cmp -s chnroutes.txt chnroutes_processed.txt; then
+            echo "Content unchanged, skipping commit"
+            echo "content_changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "Content changed, proceeding with commit"
+            echo "content_changed=true" >> $GITHUB_OUTPUT
+          fi
+        else
+          echo "First time sync, proceeding with commit"
+          echo "content_changed=true" >> $GITHUB_OUTPUT
+        fi
+    
+    - name: Update files and commit
+      if: steps.check_update.outputs.need_update == 'true' && steps.check_content.outputs.content_changed == 'true'
+      run: |
+        # 更新文件
+        mv chnroutes_processed.txt chnroutes.txt
+        echo "${{ steps.get_latest_commit.outputs.latest_commit }}" > .last_sync_commit
+        
+        # 清理临时文件
+        rm -f chnroutes_raw.txt
+        
+        # 提交更改
+        git add chnroutes.txt .last_sync_commit
+        
+        # 获取源仓库的最新提交信息
+        COMMIT_MESSAGE=$(curl -s "https://api.github.com/repos/misakaio/chnroutes2/commits/${{ steps.get_latest_commit.outputs.latest_commit }}" | jq -r '.commit.message' | head -n 1)
+        COMMIT_DATE=$(curl -s "https://api.github.com/repos/misakaio/chnroutes2/commits/${{ steps.get_latest_commit.outputs.latest_commit }}" | jq -r '.commit.author.date')
+        
+        git commit -m "Sync chnroutes.txt from misakaio/chnroutes2 ($(date '+%Y-%m-%d %H:%M:%S'))" \
+                   -m "Source commit: ${{ steps.get_latest_commit.outputs.latest_commit }}" \
+                   -m "Source message: $COMMIT_MESSAGE" \
+                   -m "Changes: Removed comment lines starting with # and empty lines"
+    
+    - name: Push changes
+      if: steps.check_update.outputs.need_update == 'true' && steps.check_content.outputs.content_changed == 'true'
+      run: |
+        git push origin main || git push origin master
+    
+    - name: Cleanup
+      if: always()
+      run: |
+        # 清理临时文件
+        rm -f chnroutes_raw.txt chnroutes_processed.txt
